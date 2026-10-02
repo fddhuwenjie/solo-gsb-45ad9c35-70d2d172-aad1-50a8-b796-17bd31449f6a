@@ -40,6 +40,7 @@ from .database import (
     CycleClosure,
     CycleInterval,
     UsageBatch,
+    cycle_write_lock,
     engine as default_engine,
 )
 from .importer import canonical_json
@@ -301,15 +302,18 @@ def close_cycle(cycle_id: str, req: CycleCloseRequest, *,
     eng = engine or default_engine
     expected_total = req.expected_total_amount.quantize(Q2)
 
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            return _close_once(eng, cycle_id, req, expected_total)
-        except OperationalError as exc:  # SQLITE_BUSY write-lock race
-            if attempt > _MAX_LOCK_RETRIES or not _is_lock_error(exc):
-                raise
-            # 全新事务重读 revision / 关账记录后整笔重跑。
+    # 进程内串行化同账期的读-改-写临界区（与批次提交/碳排快照共用一把锁），
+    # 锁覆盖整个 SQLITE_BUSY 重试循环：并发批次与关账只有一个生效。
+    with cycle_write_lock:
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return _close_once(eng, cycle_id, req, expected_total)
+            except OperationalError as exc:  # SQLITE_BUSY write-lock race
+                if attempt > _MAX_LOCK_RETRIES or not _is_lock_error(exc):
+                    raise
+                # 全新事务重读 revision / 关账记录后整笔重跑。
 
 
 def _is_lock_error(exc: OperationalError) -> bool:

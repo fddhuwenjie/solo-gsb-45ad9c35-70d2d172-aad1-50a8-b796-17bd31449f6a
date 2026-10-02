@@ -38,6 +38,7 @@ from .database import (
     CycleClosure,
     CycleInterval,
     UsageBatch,
+    cycle_write_lock,
     engine as default_engine,
 )
 from .importer import canonical_json
@@ -258,16 +259,20 @@ def submit_batch(cycle_id: str, req: SettlementBatchRequest, *,
     new_intervals = pricing.parse_usage_intervals(req.intervals)
     digest = _content_digest(req.version, new_intervals)
 
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            return _submit_once(eng, cycle_id, req, new_intervals, digest)
-        except OperationalError as exc:  # SQLITE_BUSY same-revision race
-            if attempt > _MAX_LOCK_RETRIES or not _is_lock_error(exc):
-                raise
-            # Serialized retry: re-read revision / idempotency record and
-            # re-run all checks from scratch on a fresh transaction.
+    # 进程内串行化同账期的读-改-写临界区（与关账/碳排快照共用一把锁），且
+    # 锁覆盖整个 SQLITE_BUSY 重试循环：同 revision 并发只有一个生效，落败方
+    # 在全新事务里看到先到者已提交的 revision 后得到 revision_conflict / 重放。
+    with cycle_write_lock:
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return _submit_once(eng, cycle_id, req, new_intervals, digest)
+            except OperationalError as exc:  # SQLITE_BUSY same-revision race
+                if attempt > _MAX_LOCK_RETRIES or not _is_lock_error(exc):
+                    raise
+                # Serialized retry: re-read revision / idempotency record and
+                # re-run all checks from scratch on a fresh transaction.
 
 
 def _is_lock_error(exc: OperationalError) -> bool:

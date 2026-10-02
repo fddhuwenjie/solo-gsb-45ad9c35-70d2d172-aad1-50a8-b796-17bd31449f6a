@@ -10,8 +10,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy.orm import Session
 
 from . import (
-    allocation, backup, closing, demand, diff, estimate, importer, meter,
-    pricing, settlement, shiftplan,
+    allocation, backup, carbon, closing, demand, diff, estimate, importer,
+    meter, pricing, settlement, shiftplan,
 )
 from .database import engine, init_db
 from .pricing import (
@@ -24,6 +24,8 @@ from .pricing import (
 from .schemas import (
     AllocationMemberOut,
     BackupResponse,
+    CarbonSnapshotRequest,
+    CarbonSnapshotResponse,
     CostAllocationRequest,
     CostAllocationResponse,
     CycleCloseRequest,
@@ -278,6 +280,36 @@ def get_cycle_close(cycle_id: str):
     404 ``closure_not_found``。
     """
     return closing.get_closure(cycle_id)
+
+
+@app.post("/cycles/{cycle_id}/carbon", response_model=CarbonSnapshotResponse,
+          status_code=201, tags=["settlement"])
+def post_cycle_carbon(cycle_id: str, req: CarbonSnapshotRequest,
+                      response: Response):
+    """为已提交账期生成**可追溯的不可变碳排快照**。
+
+    请求提交 ``expected_revision``、``factor_version`` 与按 UTC 半开区间
+    给出的排放因子（kgCO2e/kWh，区间不得重叠且必须完整覆盖用量）。账期
+    未关账时 revision 必须匹配，关账后只能读取已冻结快照；服务把用量端点、
+    计价分段与因子边界取并集，按实际时长拆分能量，逐段给出批次、费率规则、
+    因子与排放量。因子缺口/重叠或规则计价失败整批拒绝。同账期 + 同
+    factor_version + 同内容重放原报告（200），换因子或 revision 冲突（409）。
+    """
+    result = carbon.create_carbon_snapshot(cycle_id, req)
+    if result.replayed:
+        response.status_code = 200
+    return result.body
+
+
+@app.get("/cycles/{cycle_id}/carbon/{factor_version}",
+         response_model=CarbonSnapshotResponse, tags=["settlement"])
+def get_cycle_carbon(cycle_id: str, factor_version: str):
+    """查询账期指定因子版本的不可变碳排报告（与首次生成逐字节一致）。
+
+    账期不存在返回 404 ``cycle_not_found``；账期存在但该因子版本尚未生成
+    快照返回 404 ``carbon_snapshot_not_found``。
+    """
+    return carbon.get_carbon_snapshot(cycle_id, factor_version)
 
 
 @app.post("/usage-estimate", response_model=UsageEstimateResponse,

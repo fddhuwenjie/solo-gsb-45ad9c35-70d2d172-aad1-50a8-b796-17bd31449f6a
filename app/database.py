@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from datetime import date
 
 from sqlalchemy import (
@@ -34,6 +35,19 @@ if _is_memory:
     _engine_kwargs["poolclass"] = StaticPool
 
 engine = create_engine(_database_url(), connect_args=_connect_args, **_engine_kwargs)
+
+
+# 账期写操作（批次提交 / 关账 / 碳排快照）的**进程内**读-改-写临界区锁。
+#
+# SQLite WAL 的延迟事务在**首次写入**时才升级为保留锁；两个同 revision 的
+# 条件 UPDATE 若各自只在 COMMIT 前改写同一行，单靠 SQLITE_BUSY 无法让败者
+# 重读到新 revision（两者都会报告 rowcount=1）。因此用这把可重入锁在同一
+# 进程内把"读账期 -> 校验 -> 条件写 -> 落明细"的整段临界区串行化：后到者在
+# 全新事务里看到先到者已提交的 revision/状态，得到 revision_conflict /
+# cycle_closed / 幂等重放。锁是可重入的，便于嵌套调用；跨进程仍由 SQLite
+# 文件写锁与 Online Backup 保证（本服务 Compose 单实例部署）。
+cycle_write_lock = threading.RLock()
+
 
 
 def configure_sqlite_engine(eng, *, is_memory: bool = False,
@@ -274,6 +288,49 @@ class CycleClosure(Base):
     # 按批次（revision）与区间（revision, seq）稳定排序后的明细 SHA-256。
     detail_digest: Mapped[str] = mapped_column(String(64))
     snapshot_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(40))
+
+
+class CarbonSnapshot(Base):
+    """账期的**不可变碳排快照**（同一账期 + factor_version 至多一行）。
+
+    快照在单个 SQLite 写事务内生成：重新读取账期 revision、全部批次与
+    UTC 用量区间；账期未关账时 ``expected_revision`` 必须匹配当前 revision，
+    关账后只能读取已冻结的快照。排放因子按请求声明的 UTC 半开区间给出
+    （不得重叠且必须完整覆盖用量），与用量端点、计价分段端点取并集后按
+    实际 UTC 时长拆分能量，逐段计算排放量。
+
+    ``(cycle_id, factor_version)`` 唯一：同账期同因子版本同内容（revision、
+    因子内容、用量、计价结果一致）重放原报告（HTTP 200）；换 revision 或
+    因子内容不同 → 409 ``carbon_conflict``。换一个 ``factor_version`` 则
+    可以为同一账期再存一份独立快照。
+    """
+
+    __tablename__ = "carbon_snapshots"
+    __table_args__ = (
+        UniqueConstraint("cycle_id", "factor_version",
+                         name="uq_carbon_snapshot_cycle_factor"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    cycle_id: Mapped[str] = mapped_column(
+        ForeignKey("billing_cycles.cycle_id", ondelete="CASCADE"), index=True
+    )
+    factor_version: Mapped[str] = mapped_column(String(128))
+    # 生成快照时账期的 revision（开放账期必须等于 expected_revision）。
+    revision: Mapped[int] = mapped_column(Integer)
+    version_code: Mapped[str] = mapped_column(String(64))
+    currency: Mapped[str] = mapped_column(String(8))
+    energy_unit: Mapped[str] = mapped_column(String(16))
+    total_energy: Mapped[str] = mapped_column(String(64))
+    total_amount: Mapped[str] = mapped_column(String(32))
+    total_emission: Mapped[str] = mapped_column(String(64))
+    # 请求因子区间（规范化后）与账期明细合并内容的 SHA-256，用于同键冲突判定。
+    content_digest: Mapped[str] = mapped_column(String(64))
+    # 持久化报告规范摘要（对完整报告内容取 SHA-256），随报告原样保存。
+    report_digest: Mapped[str] = mapped_column(String(64))
+    report_json: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(8))  # 生成时账期状态 open/closed
     created_at: Mapped[str] = mapped_column(String(40))
 
 

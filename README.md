@@ -54,6 +54,11 @@ SQLite 数据文件持久化在 Docker 卷 `tariff-data`（容器内 `/data/tari
 - `cycle_closures`：`POST /cycles/{id}/close` 的**不可变关账快照**（唯一
   close_id、关账时 revision/累计金额、按批次与区间稳定排序计算的明细
   SHA-256、完整快照 JSON）；每个账期至多一行，关账后不可覆盖。
+- `carbon_snapshots`：`POST /cycles/{id}/carbon` 的**不可变碳排快照**
+  （`(cycle_id, factor_version)` 唯一、生成时 revision/status、总能量/总
+  金额/总排放、因子内容+账期明细的 `content_digest`、完整报告的
+  `report_digest` 与自包含报告 JSON）；同账期可按不同因子版本各存一份，
+  同因子版本同内容幂等重放、换 revision/因子内容冲突。
 - `database_backups`：`POST /backups/{id}` 的备份登记（backup_id、
   文件名、字节数、SHA-256、发布时间），用于幂等重放、不可覆盖判定与
   重启后的下载/核对；备份文件本身位于数据卷的 `backups/` 目录。
@@ -1084,6 +1089,147 @@ curl -s localhost:8000/cycles/demo-2024-07/close
 `GET /cycles/{cycle_id}` 的账期状态在关账后也会带 `"status": "closed"`、
 `closed_at` 与 `close_id` 字段。
 
+### `POST /cycles/{cycle_id}/carbon`
+
+为**已提交账期**生成可追溯、不可变的**碳排快照**。请求提交
+`expected_revision`、`factor_version` 与按 **UTC 半开区间**给出的排放因子
+（单位 **kgCO2e/kWh**）：
+
+```bash
+curl -s -X POST localhost:8000/cycles/demo-2024-07/carbon \
+  -H 'Content-Type: application/json' -d '{
+  "expected_revision": 2,
+  "factor_version": "grid-mix-2024",
+  "factors": [
+    {"start": "2024-07-06T04:00:00Z", "end": "2024-07-06T05:00:00Z",
+     "factor": "0.300"},
+    {"start": "2024-07-06T05:00:00Z", "end": "2024-07-06T06:00:00Z",
+     "factor": "0.500"}
+  ]
+}'
+```
+
+- 因子区间**必须携带 UTC 偏移量**（`Z` / `+00:00`），按 UTC 半开
+  `[start, end)` 解释；**区间不得重叠**（首尾相接允许），且其并集必须
+  **完整覆盖账期的全部用量时刻**（因子允许超出用量边界）。因子缺口 →
+  **409 `factor_gap`**，因子重叠 → **400 `factor_overlap`**，端点未带
+  UTC 偏移 → **400 `offset_required`**。
+- **账期未关账（open）时 `expected_revision` 必须匹配当前 revision**，否则
+  **409 `revision_conflict`**；碳排快照是**不推进 revision 的记账性读取**，
+  快照生成后仍可继续提交批次（旧快照保留为该 revision 的不可变记录）。
+  **关账后**账期冻结，只能读取/重放已持久化的不可变快照，不能用新因子
+  版本重新生成（**409 `cycle_closed`**）。
+
+服务在单个写事务内重新读取账期 revision、全部批次与 UTC 区间，复用计价
+引擎对账期整体重算（规则缺口/结构问题同样以 **409 `rule_gap` /
+`rule_conflict`** 整批拒绝），然后：
+
+1. 取**用量端点、计价分段边界与因子边界的 UTC 并集**，沿时间线切成原子
+   半开段——因此因子在某时刻变化、或能量跨累计阶梯，都会精确切段；
+2. 能量按各原子段相对其**原用量区间**的**实际 UTC 时长**比例分摊（六位
+   小数），舍入余量归入该原区间的**末段**，**能量按原区间严格守恒**；
+3. 每段按其起点命中唯一因子，`排放 = 能量 × 因子`，同样在原区间末段吸收
+   舍入余量，使**排放量按原区间守恒**；总排放为各段之和。
+
+承接前面两批示例（revision=2、120 kWh，04:00Z–06:00Z；服务端口 **8000**），
+因子在 05:00Z 由 0.3 变为 0.5，累计阶梯在 100 kWh（05:40Z）处跨档，返回：
+
+```json
+{
+  "cycle_id": "demo-2024-07",
+  "factor_version": "grid-mix-2024",
+  "version": "us-ny-demo-v2024",
+  "currency": "USD",
+  "energy_unit": "kWh",
+  "emission_unit": "kgCO2e",
+  "revision": 2,
+  "status": "open",
+  "total_energy": "120",
+  "total_amount": "18.60",
+  "total_emission": "48.000000",
+  "content_digest": "…",
+  "report_digest": "…",
+  "created_at": "2026-10-02T08:00:00+00:00",
+  "factors": [
+    {"start": "2024-07-06T04:00:00Z", "end": "2024-07-06T05:00:00Z",
+     "factor": "0.3"},
+    {"start": "2024-07-06T05:00:00Z", "end": "2024-07-06T06:00:00Z",
+     "factor": "0.5"}
+  ],
+  "segments": [
+    {"seq": 0,
+     "start": "2024-07-06T04:00:00Z", "end": "2024-07-06T05:00:00Z",
+     "duration_seconds": 3600,
+     "batch_revision": 1, "idempotency_key": "batch-1", "interval_seq": 0,
+     "energy": "60.000000",
+     "rule_code": "leisure", "rule_name": "周末与节假日（全天）",
+     "tier_ordinal": 1, "unit_price": "0.15", "amount": "9.000000",
+     "factor": "0.3",
+     "factor_start": "2024-07-06T04:00:00Z",
+     "factor_end":   "2024-07-06T05:00:00Z",
+     "emission": "18.000000"},
+    {"seq": 1,
+     "start": "2024-07-06T05:00:00Z", "end": "2024-07-06T05:40:00Z",
+     "batch_revision": 2, "idempotency_key": "batch-2", "interval_seq": 1,
+     "energy": "40.000000", "rule_code": "leisure", "tier_ordinal": 1,
+     "unit_price": "0.15", "amount": "6.000000",
+     "factor": "0.5", "emission": "20.000000", "…": "…"},
+    {"seq": 2,
+     "start": "2024-07-06T05:40:00Z", "end": "2024-07-06T06:00:00Z",
+     "energy": "20.000000", "tier_ordinal": 2,
+     "factor": "0.5", "emission": "10.000000", "…": "…"}
+  ],
+  "quote": { "…": "关账同款的账期整体重算完整 /quote 报价（自包含）" }
+}
+```
+
+逐段给出**批次**（`batch_revision` / `idempotency_key`）、**费率规则**
+（`rule_code` / `rule_name` / `tier_ordinal` / `unit_price` / `amount`）、
+**因子**（`factor` 与命中的 `factor_start`/`factor_end`，可追溯到是哪条
+因子）、**能量与排放量**。上例 60×0.3 + 40×0.5 + 20×0.5 =
+18+20+10 = **48.000000 kgCO2e**；各段能量之和 60+40+20 = 120，各段金额之和
+9+6+3.6 = 18.60，均严格守恒。
+
+**不可变报告与幂等语义**：
+
+- 报告以**规范摘要**（`report_digest`，对剔除自身摘要字段后的完整报告取
+  SHA-256；`content_digest` 覆盖因子内容 + 账期身份/revision/明细/结果）
+  持久化，自包含（含整体重算的完整 `quote`），可离线核对。
+- **同账期 + 同 `factor_version` + 同内容**（revision、因子、用量、计价
+  一致）重放原报告 → HTTP **200**，响应体与首次**逐字节一致**，不写库。
+- 同账期同 `factor_version` **换因子内容**或 **revision 不一致** →
+  **409 `carbon_conflict`**（`details` 给出首次与本次的 revision 与摘要）。
+- **换一个 `factor_version`** 可以为同一账期再存一份相互独立的快照
+  （`(cycle_id, factor_version)` 唯一）。
+- 任何因子缺口/重叠、revision 不匹配或规则计价失败都在写库前抛出，
+  **整批拒绝、不留快照**。
+
+| 情形 | 结果 |
+| --- | --- |
+| 开放账期首次生成 | **201**，保存不可变报告（不推进 revision） |
+| 同账期同 factor_version 同内容（含相同 expected_revision）重放 | **200**，逐字节返回首次报告 |
+| 开放账期 `expected_revision` 过期且该因子版本尚无快照 | **409 `revision_conflict`** |
+| 同 factor_version 换因子内容 / 换 revision 重放 | **409 `carbon_conflict`** |
+| 关账后用**新 factor_version** 生成 | **409 `cycle_closed`** |
+| 关账后同 factor_version 同内容重放 / GET 读取 | **200**，读取不可变快照 |
+| 因子区间重叠 | **400 `factor_overlap`** |
+| 因子未完整覆盖用量 | **409 `factor_gap`** |
+| 因子端点未带 UTC 偏移 / 区间非法 / factor_version 非法 | **400** `offset_required` / `invalid_interval` / `invalid_factor_version` |
+| 计价遇规则缺口 / 版本结构问题 | **409** `rule_gap` / `rule_conflict` |
+| 账期不存在 | **404 `cycle_not_found`** |
+
+### `GET /cycles/{cycle_id}/carbon/{factor_version}`
+
+读取账期某因子版本的不可变碳排报告（响应体与首次生成**逐字节一致**）。
+账期不存在 → **404 `cycle_not_found`**；账期存在但该因子版本尚未生成快照
+→ **404 `carbon_snapshot_not_found`**。
+
+```bash
+curl -s localhost:8000/cycles/demo-2024-07/carbon/grid-mix-2024
+```
+
+
+
 ### `POST /backups/{backup_id}`
 
 **服务不暂停**地导出可迁移的 SQLite 快照，供离线核对。调用方指定一个
@@ -1156,6 +1302,8 @@ curl -s -X POST localhost:8000/backups/2026-10-01-recon
 | GET | `/cycles/{cycle_id}` | 查看账期当前 revision、open/closed 状态、累计总量/总额、批次摘要与全部 UTC 区间（见上） |
 | POST | `/cycles/{cycle_id}/close` | 原子关账：单写事务重读 revision/全部批次/累计金额，revision 与金额都匹配才置 closed，按批次与区间稳定排序计算明细 SHA-256 并保存不可变快照；同 close_id 同内容重放、换内容冲突，并发批次与关账只有一个生效（见上） |
 | GET | `/cycles/{cycle_id}/close` | 查询不可变关账快照（账期不存在 404、未关账 404 closure_not_found；见上） |
+| POST | `/cycles/{cycle_id}/carbon` | 已提交账期的可追溯碳排快照：UTC 半开因子区间（不得重叠、完整覆盖用量）+ 用量/计价/因子边界并集按实际时长切分能量，逐段批次/费率/因子/排放量；open 时 revision 必须匹配，关账后读不可变快照，规范摘要持久化、同账期+因子版本+内容幂等重放（见上） |
+| GET | `/cycles/{cycle_id}/carbon/{factor_version}` | 读取指定因子版本的不可变碳排报告（账期不存在 404、无该版本快照 404 carbon_snapshot_not_found；见上） |
 | POST | `/backups/{backup_id}` | 服务不暂停的在线 SQLite 快照：Online Backup API 分批复制、integrity_check、SHA-256/字节数、原子发布、幂等重放、不可覆盖（见上） |
 | GET | `/backups/{backup_id}` | 查询已发布备份的元数据（下载地址、摘要、字节数；见上） |
 | GET | `/backups/{backup_id}/download` | 下载已发布的自包含 SQLite 副本（见上） |
@@ -1190,6 +1338,12 @@ curl -s -X POST localhost:8000/backups/2026-10-01-recon
 | 409 | `close_conflict` | 同一 `close_id` 已用于内容不同的关账（换 revision/金额/账期）；快照不可变，只能同内容重放 |
 | 400 | `invalid_close_id` | 关账 ID 不符合 `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`（含路径穿越尝试） |
 | 404 | `closure_not_found` | `GET /cycles/{cycle_id}/close` 查询的账期存在但尚未关账，没有快照 |
+| 400 | `invalid_factor_version` | 碳排快照的 factor_version 不符合 `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$` |
+| 400 | `factor_overlap` | 碳排因子的 UTC 半开区间相互重叠（首尾相接允许） |
+| 409 | `factor_gap` | 碳排因子未完整覆盖账期用量（存在没有任何因子覆盖的用量时刻），整批拒绝 |
+| 400 | `offset_required` | 碳排因子区间端点未携带 UTC 偏移量 |
+| 409 | `carbon_conflict` | 同账期同 factor_version 已存在 revision 或因子内容不同的碳排快照；快照不可变，只能同内容重放 |
+| 404 | `carbon_snapshot_not_found` | `GET /cycles/{cycle_id}/carbon/{factor_version}` 查询的账期存在但该因子版本尚无快照 |
 | 400 | `invalid_backup_id` | 备份 ID 不符合 `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`（含路径穿越尝试） |
 | 404 | `backup_not_found` | 查询/下载一个尚未发布的备份 |
 | 410 | `backup_file_missing` | 有登记行但备份文件在数据卷上缺失（正常不会出现，重启清扫会移除该行） |
@@ -1246,7 +1400,7 @@ pip install pytest httpx
 python -m pytest -q
 ```
 
-测试使用内存 SQLite（`StaticPool`），共 205 个用例，覆盖跨日、春秋 DST、
+测试使用内存 SQLite（`StaticPool`），共 239 个用例，覆盖跨日、春秋 DST、
 节假日/调休、跨档切分、重叠与缺口报错、版本对比（原子段对账、
 rule/tier/单价变化原因、币种拒绝），以及 `/shift-plan` 的候选枚举、
 跨任务共享累计阶梯、同价字典序决胜、规则缺口只淘汰对应候选、
@@ -1294,6 +1448,20 @@ SHA-256/字节数与实际文件一致、同 backup_id 重放返回首次元数�
 等失败路径不改变账期也不留快照、8 路不同 close_id 只有一份快照、
 8 路同 close_id 同内容全部拿到同一快照、4 路关账对 4 路批次只有一方
 生效且落败方收到对应 409、重启后快照可查/可重放/仍拒绝新批次，以及
+HTTP 端到端的 201/200/400/404/409 响应；
+**碳排快照**（`tests/test_carbon.py`，同样临时文件型 SQLite + 真实写锁）
+覆盖因子边界 + 计价分段 + 阶梯跨档的并集切分与逐段批次/费率/因子归属、
+单一因子与报价分段一一对应、因子超出用量边界、因子边界切开计价分段后
+金额守恒、**能量/排放/金额三条守恒线**（按原用量区间，六位小数余量归入
+末段；含 10.000001 等分数能量的逐区间严格对账）、总排放等于各段之和、
+同 factor_version 同内容逐字节重放（因子乱序规范化）、换因子/换 revision
+冲突、不同 factor_version 并存、open 账期 revision 不匹配、账期不存在、
+因子缺口/重叠/未带偏移/区间非法/factor_version 非法/负因子、规则计价
+失败整批拒绝不留快照、关账后只读不可变快照（同内容重放、新因子版本
+cycle_closed、换因子 carbon_conflict）、report_digest 对完整报告可重算、
+content_digest 随因子变化、自包含 quote、4 路同因子版本并发只存一份、
+快照对批次/关账在进程写锁下串行化（不推进 revision 的语义）、重启后
+报告可查/可重放/仍冲突、春季 DST 23 小时按实际时长分摊仍守恒，以及
 HTTP 端到端的 201/200/400/404/409 响应。
 
 ## 目录结构
@@ -1315,6 +1483,10 @@ app/
   closing.py    # 原子关账：单写事务重读 revision/全部批次/累计金额，
                 #   条件置 closed、批次/区间稳定排序的明细 SHA-256、
                 #   不可变快照保存与同 close_id 幂等重放/冲突
+  carbon.py     # 碳排快照：UTC 半开因子校验（不重叠/完整覆盖）、用量+计价
+                #   分段+因子边界并集按实际时长切分、能量与排放按原区间守恒
+                #   （六位小数余量归末段）、规范摘要持久化的不可变报告与
+                #   同账期+factor_version 幂等重放/冲突
   backup.py     # 在线快照：SQLite Online Backup API 独立连接分批复制、
                 #   integrity_check、SHA-256/字节数、原子发布、幂等与
                 #   不可覆盖、失败清理与启动清扫

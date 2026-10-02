@@ -755,6 +755,113 @@ class CycleCloseResponse(BaseModel):
         ..., description="关账时对账期全部区间整体重算的完整报价")
 
 
+# ----------------------------------------------------------- carbon snapshot
+
+
+class CarbonFactorIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start: str = Field(
+        ...,
+        description="因子生效的 UTC 半开区间起点（ISO-8601），必须携带 "
+        "UTC 偏移量（如 Z / +00:00）",
+    )
+    end: str = Field(
+        ...,
+        description="因子生效的 UTC 半开区间终点（半开 [start, end)），"
+        "必须携带 UTC 偏移量",
+    )
+    factor: Decimal = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="该区间的排放因子（kgCO2e/kWh，非负）",
+    )
+
+
+class CarbonSnapshotRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(
+        ..., ge=0,
+        description="客户端已知的账期 revision；账期未关账（open）时必须"
+        "与当前 revision 一致，否则 409 revision_conflict；关账后按已冻结"
+        "快照读取（同因子版本同内容重放）",
+    )
+    factor_version: str = Field(
+        ..., min_length=1, max_length=128,
+        description="排放因子版本号（字母/数字开头，可含 _/-）；同一账期 + "
+        "因子版本至多一份快照，同内容重放原报告，换 revision/因子内容冲突",
+    )
+    factors: list[CarbonFactorIn] = Field(
+        ..., min_length=1,
+        description="按 UTC 半开区间给出的排放因子；区间不得重叠，且必须"
+        "完整覆盖账期全部用量时刻（允许超出用量边界）",
+    )
+
+
+class CarbonSegmentOut(BaseModel):
+    seq: int = Field(..., description="碳排分段在报告中的全局序号（按 UTC 时间）")
+    start: str = Field(..., description="分段 UTC 起点（Z 后缀）")
+    end: str = Field(..., description="分段 UTC 终点（Z 后缀），与下一段首尾相接")
+    duration_seconds: int = Field(..., description="分段实际 UTC 时长（秒）")
+    batch_revision: int = Field(
+        ..., description="该段用量所属批次提交成功后的 revision")
+    idempotency_key: str = Field(..., description="该段用量所属批次的幂等键")
+    interval_seq: int = Field(..., description="该段用量所属区间的账期全局序号")
+    energy: str = Field(
+        ..., description="按实际时长分摊到该段的能量（六位小数）")
+    rule_code: str = Field(..., description="该段命中的费率规则代码")
+    rule_name: str
+    tier_ordinal: int = Field(..., description="该段所在的累计阶梯序号")
+    unit_price: str = Field(..., description="该段费率单价")
+    amount: str = Field(..., description="该段费用（六位小数）")
+    factor: str = Field(
+        ..., description="该段适用的排放因子（kgCO2e/kWh）")
+    factor_start: str = Field(
+        ..., description="命中因子区间的 UTC 起点（Z 后缀），便于追溯")
+    factor_end: str = Field(..., description="命中因子区间的 UTC 终点（Z 后缀）")
+    emission: str = Field(
+        ..., description="该段排放量 kgCO2e（六位小数）；同原区间各段之和"
+        "严格等于按因子重算的该区间总排放，舍入余量归入末段")
+
+
+class CarbonFactorOut(BaseModel):
+    start: str = Field(..., description="因子区间 UTC 起点（Z 后缀）")
+    end: str = Field(..., description="因子区间 UTC 终点（Z 后缀）")
+    factor: str = Field(..., description="kgCO2e/kWh")
+
+
+class CarbonSnapshotResponse(BaseModel):
+    cycle_id: str = Field(..., description="账期 ID（路径参数回显）")
+    factor_version: str = Field(..., description="排放因子版本号（请求回显）")
+    version: str = Field(..., description="账期锁定的规则版本号")
+    currency: str
+    energy_unit: str
+    emission_unit: str = Field(
+        ..., description="排放计量单位，固定 kgCO2e")
+    revision: int = Field(
+        ..., description="快照对应的账期 revision（关账不推进 revision）")
+    status: str = Field(
+        ..., description="生成快照时的账期状态：open / closed")
+    total_energy: str = Field(
+        ..., description="账期全部用量之和（精确值），与各段能量之和一致")
+    total_amount: str = Field(..., description="账期整体重算的累计总额（两位小数）")
+    total_emission: str = Field(
+        ..., description="账期总排放量 kgCO2e（六位小数），等于各段排放之和")
+    content_digest: str = Field(
+        ..., description="因子内容（规范化）+ 账期明细的 SHA-256，用于同键"
+        "冲突判定")
+    report_digest: str = Field(
+        ..., description="持久化报告规范摘要（对完整报告取 SHA-256）")
+    created_at: str = Field(..., description="快照生成时间（UTC ISO-8601）")
+    factors: list[CarbonFactorOut] = Field(
+        ..., description="请求因子区间规范化（UTC、按起点排序）后的回显")
+    segments: list[CarbonSegmentOut] = Field(
+        ..., description="用量端点、计价分段与因子边界取并集后的逐段批次、"
+        "费率规则、因子、能量与排放量")
+    quote: QuoteResponse = Field(
+        ..., description="账期全部区间整体重算的完整 /quote 报价（自包含）")
+
+
 # ------------------------------------------------------------------ backup
 
 
