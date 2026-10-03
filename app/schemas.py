@@ -755,6 +755,101 @@ class CycleCloseResponse(BaseModel):
         ..., description="关账时对账期全部区间整体重算的完整报价")
 
 
+# ---------------------------------------------------------- carbon snapshot
+
+
+class CarbonFactorIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start: str = Field(
+        ..., description="因子区间起点（ISO-8601，必须携带 UTC 偏移量，如 Z）"
+    )
+    end: str = Field(
+        ..., description="因子区间终点（ISO-8601，半开区间，必须携带 UTC 偏移量）"
+    )
+    factor: Decimal = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="排放因子（kgCO2e/kWh，非负）",
+    )
+
+
+class CarbonReportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    factor_version: str = Field(
+        ..., min_length=1, max_length=128,
+        description="排放因子数据集版本标识（如 grid-2024-v1）；与因子内容"
+        "一起参与幂等重放/冲突判定",
+    )
+    expected_revision: int = Field(
+        ..., ge=0,
+        description="客户端已知的账期 revision；未关账时必须等于当前 "
+        "revision，关账后必须等于关账时的 revision",
+    )
+    factors: list[CarbonFactorIn] = Field(
+        ..., min_length=1,
+        description="按 UTC 半开区间给出的排放因子（kgCO2e/kWh）；区间不得"
+        "重叠（首尾相接允许），且必须完整覆盖账期全部用量区间",
+    )
+
+
+class CarbonFactorOut(BaseModel):
+    start: str = Field(..., description="UTC 半开区间起点（Z 后缀）")
+    end: str = Field(..., description="UTC 半开区间终点（Z 后缀）")
+    factor: str = Field(..., description="排放因子（kgCO2e/kWh，规范形）")
+
+
+class CarbonSegmentOut(BaseModel):
+    seq: int = Field(..., description="原子段在报告内的全局序号（按 UTC 时间递增）")
+    interval_seq: int = Field(..., description="来源用量区间在账期内的全局序号")
+    revision: int = Field(..., description="来源用量区间所属批次的 revision")
+    batch_key: str | None = Field(
+        ..., description="来源批次的幂等键（可追溯到哪一批用量）"
+    )
+    start: str = Field(..., description="原子段 UTC 起点（Z 后缀，半开区间）")
+    end: str = Field(..., description="原子段 UTC 终点（Z 后缀）")
+    duration_seconds: int
+    energy: str = Field(
+        ..., description="分摊到该段的能量（六位小数；原区间末段吸收舍入余量）"
+    )
+    rule_code: str = Field(..., description="该段命中的费率规则代码")
+    rule_name: str
+    tier_ordinal: int = Field(..., description="该段所在累计阶梯序号")
+    unit_price: str = Field(..., description="该段单价（每能量单位）")
+    factor: str = Field(..., description="覆盖该段的排放因子（kgCO2e/kWh）")
+    emissions: str = Field(
+        ..., description="该段排放量 kgCO2e（六位小数；原区间末段吸收舍入余量）"
+    )
+
+
+class CarbonReportResponse(BaseModel):
+    cycle_id: str = Field(..., description="账期 ID（路径参数回显）")
+    revision: int = Field(..., description="生成报告时账期的 revision")
+    cycle_status: str = Field(..., description="生成时账期状态：open / closed")
+    version: str = Field(..., description="账期锁定的规则版本号")
+    factor_version: str = Field(..., description="排放因子数据集版本标识")
+    factor_unit: str = Field(..., description="排放因子单位，固定 kgCO2e/kWh")
+    emission_unit: str = Field(..., description="排放量单位，固定 kgCO2e")
+    energy_unit: str
+    content_digest: str = Field(
+        ..., description="因子版本 + 规范化因子区间的 SHA-256（重放/冲突判定）"
+    )
+    report_digest: str = Field(
+        ..., description="报告确定性内容（除 created_at 外）的规范 JSON SHA-256"
+    )
+    total_energy: str = Field(..., description="账期总用量（精确值）")
+    total_emissions: str = Field(
+        ..., description="账期总排放量 kgCO2e（六位小数），等于各段排放量之和"
+    )
+    factors: list[CarbonFactorOut] = Field(
+        ..., description="本次报告使用的规范化因子区间（按 UTC 起点排序）"
+    )
+    segments: list[CarbonSegmentOut] = Field(
+        ..., description="用量、计价分段与因子边界取并集后的原子段明细"
+    )
+    created_at: str = Field(..., description="报告生成时间（UTC ISO-8601）")
+
+
 # ------------------------------------------------------------------ backup
 
 

@@ -54,6 +54,10 @@ SQLite 数据文件持久化在 Docker 卷 `tariff-data`（容器内 `/data/tari
 - `cycle_closures`：`POST /cycles/{id}/close` 的**不可变关账快照**（唯一
   close_id、关账时 revision/累计金额、按批次与区间稳定排序计算的明细
   SHA-256、完整快照 JSON）；每个账期至多一行，关账后不可覆盖。
+- `carbon_reports`：`POST /cycles/{id}/carbon` 的**不可变碳排报告**
+  （生成时 revision、factor_version、因子内容摘要与报告摘要的双重
+  SHA-256、总排放量、完整报告 JSON）；每个账期至多一行，同 revision
+  同因子重放、换因子或 revision 冲突。
 - `database_backups`：`POST /backups/{id}` 的备份登记（backup_id、
   文件名、字节数、SHA-256、发布时间），用于幂等重放、不可覆盖判定与
   重启后的下载/核对；备份文件本身位于数据卷的 `backups/` 目录。
@@ -1084,6 +1088,134 @@ curl -s localhost:8000/cycles/demo-2024-07/close
 `GET /cycles/{cycle_id}` 的账期状态在关账后也会带 `"status": "closed"`、
 `closed_at` 与 `close_id` 字段。
 
+### `POST /cycles/{cycle_id}/carbon`
+
+为**已提交的账期生成可追溯的不可变碳排快照**。请求提交
+`factor_version`（排放因子数据集版本标识）、`expected_revision` 与一组
+按 **UTC 半开区间**给出的排放因子（单位 kgCO2e/kWh，时刻必须携带 UTC
+偏移量；区间互不重叠、首尾相接允许，且必须**完整覆盖**账期全部用量）。
+
+处理语义：
+
+1. **先判幂等重放**：同账期已有报告时，同 revision + 同 factor_version
+   + 同内容（因子区间换算成 UTC、规范化后取 SHA-256，列表顺序与等价
+   数值写法不影响摘要）→ 返回**首次报告**（HTTP **200**，不写库）；
+   revision 不同 → **409 `revision_conflict`**；同 revision 换因子版本
+   或因子内容 → **409 `carbon_conflict`**。
+2. 账期不存在 → **404 `cycle_not_found`**；`expected_revision` 与账期
+   当前 revision 不一致 → **409 `revision_conflict`**（未关账与已关账
+   同一检查：关账后 revision 冻结）。
+3. **未关账**账期读取实时区间与批次；**已关账**账期读取不可变关账
+   快照中的区间与批次。
+4. 因子区间必须完整覆盖账期用量：缺口 → **409 `factor_gap`**（给出
+   首个未覆盖时刻与所属区间）；因子区间相互重叠 →
+   **400 `factor_overlap`**；朴素时间未带偏移量 → **400
+   `offset_required`**。
+5. 复用计价引擎对账期整体重算（规则缺口/结构问题 → 409
+   `rule_gap` / `rule_conflict`，与 `/quote` 同语义），把**用量区间、
+   计价分段与因子边界的并集**切成原子段：能量按实际 UTC 时长分摊
+   （六位小数，余量归入该区间末段），逐段给出所属批次（revision +
+   幂等键）、命中费率规则与阶梯、排放因子与排放量；排放量同样按原
+   用量区间守恒（六位小数余量归入末段），总排放量为各段之和。
+6. **因子缺口、重叠或计价失败整批拒绝**——不写入任何数据；成功才在
+   单事务内持久化不可变报告（每账期至多一份）。
+
+承接上面两批示例（revision=2、累计 120 kWh，服务端口 **8000**）：
+
+```bash
+curl -s -X POST localhost:8000/cycles/demo-2024-07/carbon \
+  -H 'Content-Type: application/json' -d '{
+  "factor_version": "grid-2024-v1",
+  "expected_revision": 2,
+  "factors": [
+    {"start": "2024-07-06T04:00:00Z", "end": "2024-07-06T05:00:00Z",
+     "factor": "0.4"},
+    {"start": "2024-07-06T05:00:00Z", "end": "2024-07-06T06:00:00Z",
+     "factor": "0.55"}
+  ]
+}'
+```
+
+首次生成返回 **201**（节选）：
+
+```json
+{
+  "cycle_id": "demo-2024-07",
+  "revision": 2,
+  "cycle_status": "open",
+  "version": "us-ny-demo-v2024",
+  "factor_version": "grid-2024-v1",
+  "factor_unit": "kgCO2e/kWh",
+  "emission_unit": "kgCO2e",
+  "energy_unit": "kWh",
+  "content_digest": "6b4d…4c31",
+  "report_digest": "e1f9…b68c",
+  "total_energy": "120",
+  "total_emissions": "57.000000",
+  "factors": [
+    {"start": "2024-07-06T04:00:00Z", "end": "2024-07-06T05:00:00Z",
+     "factor": "0.4"},
+    {"start": "2024-07-06T05:00:00Z", "end": "2024-07-06T06:00:00Z",
+     "factor": "0.55"}
+  ],
+  "segments": [
+    {"seq": 0, "interval_seq": 0, "revision": 1, "batch_key": "batch-1",
+     "start": "2024-07-06T04:00:00Z", "end": "2024-07-06T05:00:00Z",
+     "duration_seconds": 3600, "energy": "60.000000",
+     "rule_code": "leisure", "rule_name": "周末与节假日（全天）",
+     "tier_ordinal": 1, "unit_price": "0.15",
+     "factor": "0.4", "emissions": "24.000000"},
+    {"seq": 1, "interval_seq": 1, "revision": 2, "batch_key": "batch-2",
+     "start": "2024-07-06T05:00:00Z", "end": "2024-07-06T05:40:00Z",
+     "duration_seconds": 2400, "energy": "40.000000",
+     "rule_code": "leisure", "rule_name": "周末与节假日（全天）",
+     "tier_ordinal": 1, "unit_price": "0.15",
+     "factor": "0.55", "emissions": "22.000000"},
+    {"seq": 2, "interval_seq": 1, "revision": 2, "batch_key": "batch-2",
+     "start": "2024-07-06T05:40:00Z", "end": "2024-07-06T06:00:00Z",
+     "duration_seconds": 1200, "energy": "20.000000",
+     "rule_code": "leisure", "rule_name": "周末与节假日（全天）",
+     "tier_ordinal": 2, "unit_price": "0.18",
+     "factor": "0.55", "emissions": "11.000000"}
+  ],
+  "created_at": "2026-10-03T08:00:00+00:00"
+}
+```
+
+字段说明：
+
+- `segments`：用量、计价分段与因子边界**并集**切出的原子段（按 UTC
+  时间递增）。第二批的 60 kWh 在累计 100 kWh 阶梯边界（05:40 UTC）
+  处被计价引擎切成两段，因此每段都同时携带**批次**（`revision` +
+  `batch_key`）、**费率规则**（`rule_code` / `tier_ordinal` /
+  `unit_price`）与**排放因子**，可逐段追溯。
+- `total_emissions`：各段排放量之和（上例 60×0.4 + 40×0.55 +
+  20×0.55 = **57.000000** kgCO2e）；任一原用量区间内各段能量之和
+  严格等于该区间申报能量、各段排放量之和等于该区间总排放（六位
+  小数余量都归入末段）。
+- `content_digest`：因子版本 + 规范化因子区间的 SHA-256，用于幂等
+  重放与冲突判定；`report_digest`：报告确定性内容（除 `created_at`
+  外）的规范 JSON SHA-256，供离线核对。
+
+**幂等与不可变**（每账期至多一份报告）：
+
+| 情形 | 结果 |
+| --- | --- |
+| 同 revision + 同 factor_version + 同内容重放 | **200**，逐字节返回首次报告，不写库 |
+| 同 revision、换因子版本或因子内容 | **409 `carbon_conflict`**，`details` 给出两次摘要 |
+| revision 不匹配（含报告已存在时换 revision） | **409 `revision_conflict`** |
+| 因子未完整覆盖用量 / 因子区间重叠 / 计价失败 | **409 `factor_gap`** / **400 `factor_overlap`** / 409 `rule_gap` 等，整批拒绝不写库 |
+
+### `GET /cycles/{cycle_id}/carbon`
+
+查询账期的**不可变碳排报告**（响应体与首次生成**逐字节一致**）。账期
+不存在 → **404 `cycle_not_found`**；账期还没有碳排报告 →
+**404 `carbon_report_not_found`**。
+
+```bash
+curl -s localhost:8000/cycles/demo-2024-07/carbon
+```
+
 ### `POST /backups/{backup_id}`
 
 **服务不暂停**地导出可迁移的 SQLite 快照，供离线核对。调用方指定一个
@@ -1156,6 +1288,8 @@ curl -s -X POST localhost:8000/backups/2026-10-01-recon
 | GET | `/cycles/{cycle_id}` | 查看账期当前 revision、open/closed 状态、累计总量/总额、批次摘要与全部 UTC 区间（见上） |
 | POST | `/cycles/{cycle_id}/close` | 原子关账：单写事务重读 revision/全部批次/累计金额，revision 与金额都匹配才置 closed，按批次与区间稳定排序计算明细 SHA-256 并保存不可变快照；同 close_id 同内容重放、换内容冲突，并发批次与关账只有一个生效（见上） |
 | GET | `/cycles/{cycle_id}/close` | 查询不可变关账快照（账期不存在 404、未关账 404 closure_not_found；见上） |
+| POST | `/cycles/{cycle_id}/carbon` | 账期碳排快照：UTC 半开区间排放因子（不重叠、完整覆盖用量），用量/计价分段/因子边界取并集切原子段，逐段给出批次、费率规则、因子与排放量；expected_revision 乐观锁、关账后读快照、不可变报告幂等重放（见上） |
+| GET | `/cycles/{cycle_id}/carbon` | 查询不可变碳排报告（账期不存在 404、无报告 404 carbon_report_not_found；见上） |
 | POST | `/backups/{backup_id}` | 服务不暂停的在线 SQLite 快照：Online Backup API 分批复制、integrity_check、SHA-256/字节数、原子发布、幂等重放、不可覆盖（见上） |
 | GET | `/backups/{backup_id}` | 查询已发布备份的元数据（下载地址、摘要、字节数；见上） |
 | GET | `/backups/{backup_id}/download` | 下载已发布的自包含 SQLite 副本（见上） |
@@ -1190,6 +1324,10 @@ curl -s -X POST localhost:8000/backups/2026-10-01-recon
 | 409 | `close_conflict` | 同一 `close_id` 已用于内容不同的关账（换 revision/金额/账期）；快照不可变，只能同内容重放 |
 | 400 | `invalid_close_id` | 关账 ID 不符合 `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`（含路径穿越尝试） |
 | 404 | `closure_not_found` | `GET /cycles/{cycle_id}/close` 查询的账期存在但尚未关账，没有快照 |
+| 400 | `factor_overlap` | `/cycles/{id}/carbon` 的排放因子区间在 UTC 时间线上相互重叠（首尾相接允许） |
+| 409 | `factor_gap` | `/cycles/{id}/carbon` 的排放因子未完整覆盖账期用量；`details` 给出首个未覆盖时刻与所属区间 |
+| 409 | `carbon_conflict` | 账期已有同 revision 的不可变碳排报告，本次请求换了因子版本或因子内容 |
+| 404 | `carbon_report_not_found` | `GET /cycles/{cycle_id}/carbon` 查询的账期存在但还没有碳排报告 |
 | 400 | `invalid_backup_id` | 备份 ID 不符合 `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`（含路径穿越尝试） |
 | 404 | `backup_not_found` | 查询/下载一个尚未发布的备份 |
 | 410 | `backup_file_missing` | 有登记行但备份文件在数据卷上缺失（正常不会出现，重启清扫会移除该行） |
@@ -1246,7 +1384,7 @@ pip install pytest httpx
 python -m pytest -q
 ```
 
-测试使用内存 SQLite（`StaticPool`），共 205 个用例，覆盖跨日、春秋 DST、
+测试使用内存 SQLite（`StaticPool`），共 236 个用例，覆盖跨日、春秋 DST、
 节假日/调休、跨档切分、重叠与缺口报错、版本对比（原子段对账、
 rule/tier/单价变化原因、币种拒绝），以及 `/shift-plan` 的候选枚举、
 跨任务共享累计阶梯、同价字典序决胜、规则缺口只淘汰对应候选、
@@ -1294,7 +1432,17 @@ SHA-256/字节数与实际文件一致、同 backup_id 重放返回首次元数�
 等失败路径不改变账期也不留快照、8 路不同 close_id 只有一份快照、
 8 路同 close_id 同内容全部拿到同一快照、4 路关账对 4 路批次只有一方
 生效且落败方收到对应 409、重启后快照可查/可重放/仍拒绝新批次，以及
-HTTP 端到端的 201/200/400/404/409 响应。
+HTTP 端到端的 201/200/400/404/409 响应；**碳排快照**
+（`tests/test_carbon.py`，同样临时文件型 SQLite + 真实写锁）覆盖
+平坦/分段因子下的逐段批次-规则-因子-排放量归属、用量/计价分段/因子
+边界并集切分（含累计阶梯跨界与因子边界落在计价段内部）、能量与排放
+量按原区间守恒且六位小数余量归入末段、因子列表乱序与等价数值写法
+重放、同 revision 换因子版本/因子内容冲突、换 revision 冲突、因子
+缺口（末端/中间）/重叠/朴素时间/非法区间整批拒绝且不写库、计价失败
+整批拒绝、关账后读取不可变快照、生成报告不改变账期状态且后续批次
+照常推进 revision、4 路同内容并发只生成一份报告、4 路异内容并发只有
+一个生效、重启后报告可查/可重放/仍拒绝换因子，以及 HTTP 端到端的
+201/200/400/404/409/422 响应。
 
 ## 目录结构
 
@@ -1315,6 +1463,10 @@ app/
   closing.py    # 原子关账：单写事务重读 revision/全部批次/累计金额，
                 #   条件置 closed、批次/区间稳定排序的明细 SHA-256、
                 #   不可变快照保存与同 close_id 幂等重放/冲突
+  carbon.py     # 碳排快照：UTC 半开区间排放因子解析/覆盖校验、
+                #   用量/计价分段/因子边界并集切原子段、能量与排放量
+                #   按原区间守恒（余量归末段）、不可变报告持久化与
+                #   同 revision 同因子幂等重放/冲突
   backup.py     # 在线快照：SQLite Online Backup API 独立连接分批复制、
                 #   integrity_check、SHA-256/字节数、原子发布、幂等与
                 #   不可覆盖、失败清理与启动清扫

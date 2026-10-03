@@ -277,6 +277,36 @@ class CycleClosure(Base):
     created_at: Mapped[str] = mapped_column(String(40))
 
 
+class CarbonReport(Base):
+    """账期的不可变碳排快照报告（每个账期至多一份）。
+
+    由 ``POST /cycles/{cycle_id}/carbon`` 在单个 SQLite 写事务内生成：
+    未关账账期要求 ``expected_revision`` 与当前 revision 一致并读取实时
+    区间；已关账账期读取关账快照中的区间与批次。报告把用量、计价分段与
+    排放因子边界取并集切成原子段，逐段记录批次、费率规则、因子与排放量。
+    ``content_digest`` 是因子版本 + 因子区间（规范化后）的 SHA-256，
+    ``report_digest`` 是报告确定性内容的 SHA-256；同账期同 revision 同
+    因子版本同内容的请求重放原报告，revision 或因子不同则冲突。
+    """
+
+    __tablename__ = "carbon_reports"
+
+    cycle_id: Mapped[str] = mapped_column(
+        ForeignKey("billing_cycles.cycle_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    revision: Mapped[int] = mapped_column(Integer)  # 生成时账期的 revision
+    factor_version: Mapped[str] = mapped_column(String(128))
+    # 因子版本 + 规范化因子区间的 SHA-256（重放/冲突判定）。
+    content_digest: Mapped[str] = mapped_column(String(64))
+    # 报告确定性内容（除 created_at 外）的 SHA-256，供离线核对。
+    report_digest: Mapped[str] = mapped_column(String(64))
+    total_energy: Mapped[str] = mapped_column(String(64))
+    total_emissions: Mapped[str] = mapped_column(String(64))
+    report_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(40))
+
+
 class DatabaseBackup(Base):
     """在线备份登记：backup_id -> 已发布备份文件的摘要元数据。
 

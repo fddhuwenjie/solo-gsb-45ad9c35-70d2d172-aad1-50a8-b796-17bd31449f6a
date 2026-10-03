@@ -10,8 +10,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy.orm import Session
 
 from . import (
-    allocation, backup, closing, demand, diff, estimate, importer, meter,
-    pricing, settlement, shiftplan,
+    allocation, backup, carbon, closing, demand, diff, estimate, importer,
+    meter, pricing, settlement, shiftplan,
 )
 from .database import engine, init_db
 from .pricing import (
@@ -24,6 +24,8 @@ from .pricing import (
 from .schemas import (
     AllocationMemberOut,
     BackupResponse,
+    CarbonReportRequest,
+    CarbonReportResponse,
     CostAllocationRequest,
     CostAllocationResponse,
     CycleCloseRequest,
@@ -278,6 +280,40 @@ def get_cycle_close(cycle_id: str):
     404 ``closure_not_found``。
     """
     return closing.get_closure(cycle_id)
+
+
+@app.post("/cycles/{cycle_id}/carbon", response_model=CarbonReportResponse,
+          status_code=201, tags=["carbon"])
+def post_cycle_carbon(cycle_id: str, req: CarbonReportRequest,
+                      response: Response):
+    """为已提交的账期生成可追溯的**不可变碳排快照**。
+
+    请求提交 ``factor_version``、``expected_revision`` 与按 UTC 半开区间
+    给出的排放因子（kgCO2e/kWh，互不重叠、必须完整覆盖账期用量）。账期
+    未关账时 ``expected_revision`` 必须匹配当前 revision；已关账账期读取
+    不可变关账快照中的区间与批次。计算时把用量、计价分段与因子边界取
+    并集切成原子段，能量按实际时长分摊（六位小数余量归入末段），逐段
+    返回批次、费率规则、因子与排放量；排放量按原用量区间守恒。因子缺口
+    （409 ``factor_gap``）、因子重叠（400 ``factor_overlap``）或计价失败
+    整批拒绝，不写入任何数据。同账期同 revision 同因子版本同内容重放
+    原报告（200）；revision 不同（409 ``revision_conflict``）或同
+    revision 换因子（409 ``carbon_conflict``）拒绝。
+    """
+    result = carbon.generate_report(cycle_id, req)
+    if result.replayed:
+        response.status_code = 200
+    return result.body
+
+
+@app.get("/cycles/{cycle_id}/carbon", response_model=CarbonReportResponse,
+         tags=["carbon"])
+def get_cycle_carbon(cycle_id: str):
+    """查询账期的不可变碳排报告（响应体与首次生成逐字节一致）。
+
+    账期不存在返回 404 ``cycle_not_found``；账期还没有碳排报告返回
+    404 ``carbon_report_not_found``。
+    """
+    return carbon.get_report(cycle_id)
 
 
 @app.post("/usage-estimate", response_model=UsageEstimateResponse,
